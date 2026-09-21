@@ -3,3 +3,8 @@ libs/*
 .idea
 index_dir
 tantivy-go.test
+# Cargo.lock IS committed in this fork. Upstream ignores it because the crate
+# is a library, but here it is the input to a static library that gets pinned by
+# SHA-256 and linked into a service that reads every tenant's corpus: without a
+# lock, 'the same commit' can produce a different binary.
+!rust/Cargo.lock

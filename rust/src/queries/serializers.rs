@@ -15,6 +15,8 @@ impl QueryType {
             5 => Some(QueryType::EveryTermQuery),
             6 => Some(QueryType::OneOfTermQuery),
             7 => Some(QueryType::AllQuery),
+            8 => Some(QueryType::FuzzyTermQuery),
+            9 => Some(QueryType::OneOfFuzzyTermQuery),
             _ => None,
         }
     }
@@ -135,6 +137,28 @@ impl<'de> Deserialize<'de> for QueryElement {
             (field_index, text_index, boost)
         }
 
+        fn extract_fuzzy_params(
+            query_data: &serde_json::Map<String, serde_json::Value>,
+        ) -> (u8, bool, bool) {
+            // Defaults are the conservative ones: one edit, Damerau, whole
+            // term. A caller that omits them gets the safest fuzzy query
+            // rather than the widest.
+            let distance = query_data
+                .get("distance")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .min(2) as u8;
+            let transposition = query_data
+                .get("transposition")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let prefix = query_data
+                .get("prefix")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (distance, transposition, prefix)
+        }
+
         let query = match query_type {
             QueryType::BoolQuery => {
                 let subqueries = map
@@ -189,6 +213,29 @@ impl<'de> Deserialize<'de> for QueryElement {
                         boost,
                     },
                     _ => return Err(de::Error::custom("Unknown query type")),
+                })
+            }
+            QueryType::FuzzyTermQuery | QueryType::OneOfFuzzyTermQuery => {
+                let query_data = extract_query_data::<D>(&map)?;
+                let (field_index, text_index, boost) = extract_query_indices_and_boost(query_data);
+                let (distance, transposition, prefix) = extract_fuzzy_params(query_data);
+                Some(match query_type {
+                    QueryType::FuzzyTermQuery => GoQuery::FuzzyTermQuery {
+                        field_index,
+                        text_index,
+                        distance,
+                        transposition,
+                        prefix,
+                        boost,
+                    },
+                    _ => GoQuery::OneOfFuzzyTermQuery {
+                        field_index,
+                        text_index,
+                        distance,
+                        transposition,
+                        prefix,
+                        boost,
+                    },
                 })
             }
             QueryType::AllQuery => {

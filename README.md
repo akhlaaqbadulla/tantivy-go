@@ -1,3 +1,33 @@
+> ## This is a fork
+>
+> `akhlaaqbadulla/tantivy-go`, forked from `anyproto/tantivy-go` at `v1.0.6`.
+>
+> **What it adds:** two query types, `FuzzyTermQuery` and `OneOfFuzzyTermQuery`,
+> for typo-tolerant matching.
+>
+> They do **not** wrap `tantivy::query::FuzzyTermQuery`. That type's `weight()`
+> ignores the `EnableScoring` it is handed and always returns an
+> `AutomatonWeight`, whose scorer is a `ConstScorer` — every match scores
+> identically, so dropping one into a ranked boolean query erases BM25 for that
+> clause. Instead the Levenshtein automaton is used only to **enumerate**: each
+> analyzed token is streamed against every segment's term dictionary, and the
+> matching terms become ordinary `TermQuery`s, each boosted down by its edit
+> distance. Scoring survives, and a near-miss can rank without winning.
+>
+> The edit budget is narrowed per token, on the *analyzed* form: no token
+> containing a digit is ever fuzzed, and length gates one edit at 5 characters
+> and two at 9. Expansion is capped at 50 terms per token.
+>
+> **What it changes otherwise:** the Go module path, so a consumer can point a
+> `replace` directive at it; `rust/Cargo.lock` is committed, because the crate
+> is built into a pinned artifact; and `.github/workflows/themis-release.yml`
+> builds `linux-amd64-musl` only. Every other target still comes from upstream
+> and does **not** carry the fuzzy variants.
+>
+> Nothing else is modified. The wire format is append-only: the two new query
+> types are ordinals 8 and 9, so an older library reading a newer payload
+> rejects it loudly rather than misinterpreting an existing type.
+
 # Go Tantivy Bindings
 
 This project provides Go bindings for the [Tantivy](https://github.com/quickwit-oss/tantivy) search engine library. Tantivy is a full-text search engine library written in Rust, and this project aims to make its powerful search capabilities available to Go developers.

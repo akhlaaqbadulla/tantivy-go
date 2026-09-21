@@ -5,12 +5,12 @@ import (
 	"os"
 	"testing"
 
-	"github.com/anyproto/tantivy-go/internal"
+	"github.com/akhlaaqbadulla/tantivy-go/internal"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	tantivy_go "github.com/anyproto/tantivy-go"
+	tantivy_go "github.com/akhlaaqbadulla/tantivy-go"
 )
 
 const NameBody = "body"

@@ -1,0 +1,67 @@
+# Builds the static library this fork exists to produce, and attaches it to a
+# release.
+#
+# Upstream's test.yml cannot run here: it needs an organisation PAT and a
+# self-hosted runner, and it builds twelve targets. This builds the one target
+# Project-Themis links — linux/amd64 against musl — and does it in a workflow
+# anyone can read, so the archive that ends up inside a service reading every
+# tenant's corpus has provenance beyond "someone's laptop produced it".
+#
+# The build runs in a container rather than `container:` on the job, because
+# GitHub's container support needs a glibc Node to run actions and rust:alpine
+# has none. Checkout happens on the host; only cargo runs in the container.
+name: themis-release
+
+on:
+  push:
+    tags:
+      - 'v*-themis.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-amd64-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --locked: fail rather than silently resolve a different dependency
+      # graph than the committed Cargo.lock describes. A native library linked
+      # into a multi-tenant service is exactly where a surprise transitive
+      # bump should stop the build.
+      - name: test and build
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work/rust rust:alpine sh -c '
+            set -e
+            apk add --no-cache musl-dev build-base git
+            cargo test  --locked --target x86_64-unknown-linux-musl
+            cargo build --locked --release --target x86_64-unknown-linux-musl
+          '
+
+      - name: archive
+        run: |
+          mkdir -p libs/linux-amd64-musl .release
+          sudo cp rust/target/x86_64-unknown-linux-musl/release/libtantivy_go.a \
+            libs/linux-amd64-musl/
+          sudo chown "$(id -u):$(id -g)" libs/linux-amd64-musl/libtantivy_go.a
+          # Laid out exactly as upstream's release archives are — the members
+          # sit at the root — so a consumer's fetch script needs only a new URL.
+          tar -czf .release/linux-amd64-musl.tar.gz -C libs/linux-amd64-musl .
+          echo "### sha256" >> "$GITHUB_STEP_SUMMARY"
+          sha256sum .release/linux-amd64-musl.tar.gz | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: '.release/*'
+          body: |
+            Fork of anyproto/tantivy-go with typo-tolerant query support.
+
+            Adds `FuzzyTermQuery` and `OneOfFuzzyTermQuery`, which expand a
+            Levenshtein automaton against the term dictionary into ordinary
+            term queries rather than using tantivy's own `FuzzyTermQuery`
+            (whose scorer is constant and therefore erases BM25 ranking).
+
+            Only `linux-amd64-musl` is built here. Other targets remain
+            available from upstream and do not carry the fuzzy variants.

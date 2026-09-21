@@ -1,3 +1,4 @@
+use crate::queries::fuzzy::token_alternatives;
 use crate::queries::{FinalQuery, GoQuery, QueryElement, QueryModifier};
 use crate::tantivy_util::{extract_terms, TantivyGoError};
 use tantivy::query::Occur::{Must, Should};
@@ -176,6 +177,49 @@ pub fn convert_to_tantivy(
                             let weight = 1.0 - 0.5 * ((i + 1) as f32 / len);
                             subs.push(try_boost(Should, weight,
                                 Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs))));
+                        }
+                        Some(try_boost(occur, *boost, Box::new(BooleanQuery::new(subs))))
+                    }
+                }
+                GoQuery::FuzzyTermQuery { field_index, text_index, distance, transposition, prefix, boost } => {
+                    let (f, txt) = get_field_and_text(*field_index, *text_index)?;
+                    let terms = get_terms(f, txt)?;
+                    if terms.is_empty() {
+                        if element.modifier == QueryModifier::Must {
+                            Some(try_boost(occur, *boost, create_impossible_query()))
+                        } else {
+                            return Ok(None);
+                        }
+                    } else {
+                        let alts = token_alternatives(
+                            index, f, terms[0].1.clone(), *distance, *transposition, *prefix,
+                        )?;
+                        Some(try_boost(occur, *boost, alts))
+                    }
+                }
+                GoQuery::OneOfFuzzyTermQuery { field_index, text_index, distance, transposition, prefix, boost } => {
+                    let (f, txt) = get_field_and_text(*field_index, *text_index)?;
+                    let terms = get_terms(f, txt)?;
+                    if terms.is_empty() {
+                        if element.modifier == QueryModifier::Must {
+                            Some(try_boost(occur, *boost, create_impossible_query()))
+                        } else {
+                            return Ok(None);
+                        }
+                    } else {
+                        // Identical positional weighting to OneOfTermQuery, so a
+                        // fuzzy plan is byte-identical to the non-fuzzy one when
+                        // nothing expands. The alternatives live INSIDE each
+                        // token's slot: flattened, a distance-1 hit on token 0
+                        // would outrank an exact hit on the last token.
+                        let mut subs = Vec::new();
+                        let len = terms.len() as f32;
+                        for (i, (_pos, term)) in terms.into_iter().enumerate() {
+                            let weight = 1.0 - 0.5 * ((i + 1) as f32 / len);
+                            let alts = token_alternatives(
+                                index, f, term, *distance, *transposition, *prefix,
+                            )?;
+                            subs.push(try_boost(Should, weight, alts));
                         }
                         Some(try_boost(occur, *boost, Box::new(BooleanQuery::new(subs))))
                     }
