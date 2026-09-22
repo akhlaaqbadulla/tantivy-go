@@ -13,6 +13,8 @@ pub enum QueryType {
     AllQuery,
     FuzzyTermQuery,
     OneOfFuzzyTermQuery,
+    PrefixTermQuery,
+    OneOfPrefixTermQuery,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -95,6 +97,25 @@ pub enum GoQuery {
         distance: u8,
         transposition: bool,
         prefix: bool,
+        boost: f32,
+    },
+    /// Matches every indexed term beginning with a SINGLE analyzed token.
+    ///
+    /// Like the fuzzy variants this expands against the term dictionary and
+    /// emits ordinary `TermQuery`s. It is NOT `PhrasePrefixQuery`, which is
+    /// const-scored: every completion would tie, the clause would contribute
+    /// reach but no ranking, and the tie group would be cut differently by
+    /// each replica.
+    PrefixTermQuery {
+        field_index: usize,
+        text_index: usize,
+        boost: f32,
+    },
+    /// The multi-token form: every analyzed token matched as a prefix, with
+    /// the positional weighting `OneOfTermQuery` uses.
+    OneOfPrefixTermQuery {
+        field_index: usize,
+        text_index: usize,
         boost: f32,
     },
 }

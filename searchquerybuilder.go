@@ -20,6 +20,15 @@ const (
 	// the text gets its own exact term plus fuzzy alternatives, nested inside
 	// that token's positional weight.
 	OneOfFuzzyTermQuery
+	// PrefixTermQuery matches every indexed term beginning with a single
+	// analyzed token, by expanding the term dictionary into ordinary term
+	// queries. Prefer it to TermPrefixQuery, which becomes tantivy's
+	// PhrasePrefixQuery and is CONST-SCORED: every completion ties, so the
+	// clause adds reach but no ranking, and a large tie group is cut
+	// differently by each replica of a multi-instance service.
+	PrefixTermQuery
+	// OneOfPrefixTermQuery is the multi-token form.
+	OneOfPrefixTermQuery
 )
 
 // Fuzzy defaults. Distance is capped at 2 by the Levenshtein automaton, and

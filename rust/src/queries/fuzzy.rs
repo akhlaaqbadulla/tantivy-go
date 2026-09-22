@@ -21,7 +21,7 @@
 //! intersected with the FST of known terms, with the edit budget gated on word
 //! length so that short words are not allowed to match everything.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA};
@@ -40,6 +40,17 @@ use crate::tantivy_util::TantivyGoError;
 /// `max_expansions` and is generous for the job — typo tolerance needs the
 /// handful of near-spellings, not the whole neighbourhood.
 const MAX_FUZZY_EXPANSIONS: usize = 50;
+
+/// Ceiling on the completions one prefix may expand to. Same reasoning and
+/// same number as the fuzzy cap: enough to cover what a half-typed word can
+/// reasonably mean, bounded so a two-character prefix cannot open thousands of
+/// posting lists.
+const MAX_PREFIX_EXPANSIONS: usize = 50;
+
+/// Shortest prefix worth expanding. Below this the completion set stops
+/// carrying information — and the planner already refuses shorter tokens, so
+/// this is the engine-side backstop rather than the policy.
+const MIN_PREFIX_LEN: usize = 3;
 
 /// Length gates, in characters, for each edit budget.
 ///
@@ -79,6 +90,40 @@ impl Automaton for DfaWrapper {
 
     fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
         self.0.transition(*state, byte)
+    }
+}
+
+/// Matches every term beginning with a byte prefix.
+///
+/// Written here rather than pulled from a crate: `tantivy-fst` 0.5 exposes
+/// `StartsWith<A>` but no string automaton to wrap, and the whole thing is
+/// fifteen lines. `can_match` returning false is what lets the FST prune a
+/// subtree instead of walking the whole dictionary.
+struct PrefixAutomaton<'a>(&'a [u8]);
+
+impl Automaton for PrefixAutomaton<'_> {
+    /// How many prefix bytes have matched, or None once the branch is dead.
+    type State = Option<usize>;
+
+    fn start(&self) -> Self::State {
+        Some(0)
+    }
+
+    fn is_match(&self, state: &Self::State) -> bool {
+        matches!(state, Some(i) if *i >= self.0.len())
+    }
+
+    fn can_match(&self, state: &Self::State) -> bool {
+        state.is_some()
+    }
+
+    fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
+        match state {
+            // Past the prefix: everything that follows is part of the match.
+            Some(i) if *i >= self.0.len() => Some(*i),
+            Some(i) if self.0[*i] == byte => Some(i + 1),
+            _ => None,
+        }
     }
 }
 
@@ -123,15 +168,78 @@ fn effective_distance(token: &str, requested: u8) -> u8 {
     requested.min(allowed).min(2)
 }
 
-/// Streams the term dictionaries and returns `(distance, term_text)` pairs for
-/// every indexed term within `distance` edits of `token`, excluding `token`
-/// itself.
+/// Collects every term an automaton matches, across every segment, and keeps
+/// the lexicographically smallest `cap` of them.
+///
+/// # Why a BTreeSet and not a cap checked while streaming
+///
+/// The obvious loop stops as soon as it has `cap` terms. That is not
+/// deterministic here: each `themis-search` replica builds its own index from
+/// the outbox, so the two have different SEGMENT layouts, and a stream that
+/// stops early takes whatever the first segments happened to offer. Two
+/// replicas then answer the same query with different terms — the exact class
+/// of divergence a chunk-id tiebreak was added to the service to remove.
+///
+/// Keeping the smallest `cap` instead is independent of segment layout,
+/// because each segment's stream is itself ordered and the smallest N of a
+/// union is well defined. For a prefix that also happens to be the ordering
+/// worth having: the shortest completions sort first.
+fn collect_terms<A, F>(
+    searcher: &tantivy::Searcher,
+    field: Field,
+    make_automaton: F,
+    cap: usize,
+) -> Result<BTreeSet<String>, TantivyGoError>
+where
+    A: Automaton,
+    // `TermDictionary::search` requires it, and both automata here satisfy it
+    // (a DFA state is a u32, a prefix state an Option<usize>).
+    A::State: Clone,
+    F: Fn() -> A,
+{
+    let mut kept: BTreeSet<String> = BTreeSet::new();
+    for segment in searcher.segment_readers() {
+        let inverted = match segment.inverted_index(field) {
+            Ok(inv) => inv,
+            // A segment that has never seen this field has nothing to
+            // contribute; that is not an error for the query as a whole.
+            Err(_) => continue,
+        };
+        let mut stream = inverted
+            .terms()
+            .search(make_automaton())
+            .into_stream()
+            .map_err(|e| TantivyGoError(format!("Cannot stream term dictionary: {e}")))?;
+        while stream.advance() {
+            let Ok(text) = std::str::from_utf8(stream.key()) else {
+                continue;
+            };
+            // Past the cap, a term only earns a place by displacing a larger
+            // one — so the set holds the smallest `cap` seen so far and the
+            // result cannot depend on which segment was read first.
+            if kept.len() >= cap {
+                match kept.last() {
+                    Some(largest) if text >= largest.as_str() => continue,
+                    _ => {
+                        kept.pop_last();
+                    }
+                }
+            }
+            kept.insert(text.to_string());
+        }
+    }
+    Ok(kept)
+}
+
+/// Returns `(distance, term_text)` for every indexed term within `distance`
+/// edits of `token`, excluding `token` itself.
 ///
 /// Distances are assigned by running the narrowest automaton first: a term
 /// found by the distance-1 pass is at distance 1, and the distance-2 pass then
 /// only contributes terms it did not already find. That is cheaper than
-/// recomputing an edit distance per term and cannot disagree with the automaton
-/// that actually matched.
+/// recomputing an edit distance per term and cannot disagree with the
+/// automaton that actually matched. The budget is spent in that order too, so
+/// a near miss is never displaced by a far one.
 fn expand_token(
     index: &Index,
     field: Field,
@@ -148,45 +256,110 @@ fn expand_token(
         .map_err(|e| TantivyGoError(format!("Cannot open reader for fuzzy expansion: {e}")))?;
     let searcher = reader.searcher();
 
-    let mut seen: HashSet<String> = HashSet::new();
-    seen.insert(token.to_string());
     let mut out: Vec<(u8, String)> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    seen.insert(token.to_string());
 
-    'budget: for d in 1..=distance {
+    for d in 1..=distance {
+        let remaining = MAX_FUZZY_EXPANSIONS.saturating_sub(out.len());
+        if remaining == 0 {
+            break;
+        }
         let builder = automaton_builder(d, transposition);
-        for segment in searcher.segment_readers() {
-            let inverted = match segment.inverted_index(field) {
-                Ok(inv) => inv,
-                // A segment that has never seen this field has nothing to
-                // contribute; that is not an error for the query as a whole.
-                Err(_) => continue,
-            };
-            let dfa = if prefix {
-                builder.build_prefix_dfa(token)
-            } else {
-                builder.build_dfa(token)
-            };
-            let mut stream = inverted
-                .terms()
-                .search(DfaWrapper(dfa))
-                .into_stream()
-                .map_err(|e| TantivyGoError(format!("Cannot stream term dictionary: {e}")))?;
-            while stream.advance() {
-                let Ok(text) = std::str::from_utf8(stream.key()) else {
-                    continue;
+        let found = collect_terms(
+            &searcher,
+            field,
+            || {
+                let dfa = if prefix {
+                    builder.build_prefix_dfa(token)
+                } else {
+                    builder.build_dfa(token)
                 };
-                if seen.contains(text) {
-                    continue;
-                }
-                seen.insert(text.to_string());
-                out.push((d, text.to_string()));
-                if out.len() >= MAX_FUZZY_EXPANSIONS {
-                    break 'budget;
-                }
+                DfaWrapper(dfa)
+            },
+            // Over-collect so that terms already taken at a smaller distance
+            // do not eat this pass's share.
+            remaining + seen.len(),
+        )?;
+        for text in found {
+            if out.len() >= MAX_FUZZY_EXPANSIONS {
+                break;
+            }
+            if seen.insert(text.clone()) {
+                out.push((d, text));
             }
         }
     }
     Ok(out)
+}
+
+/// Returns every indexed term beginning with `token`, excluding `token`
+/// itself, capped and deterministic.
+fn expand_prefix(
+    index: &Index,
+    field: Field,
+    token: &str,
+) -> Result<Vec<String>, TantivyGoError> {
+    let reader = index
+        .reader()
+        .map_err(|e| TantivyGoError(format!("Cannot open reader for prefix expansion: {e}")))?;
+    let searcher = reader.searcher();
+    let bytes = token.as_bytes();
+    let found = collect_terms(
+        &searcher,
+        field,
+        || PrefixAutomaton(bytes),
+        MAX_PREFIX_EXPANSIONS + 1,
+    )?;
+    Ok(found.into_iter().filter(|t| t != token).take(MAX_PREFIX_EXPANSIONS).collect())
+}
+
+/// Builds the alternatives for one analyzed token matched as a PREFIX.
+///
+/// # Why this exists rather than `PhrasePrefixQuery`
+///
+/// That is what a prefix clause used to become, and it is const-scored: a
+/// production probe of `judicia` returned exactly TWO distinct scores — one
+/// real BM25 hit and 199 documents tied at the clause boost. Two things follow
+/// from a tie that large. The clause contributes reach but no ranking, and in
+/// chunk mode, where the fetch equals the limit, the tie group is cut inside
+/// Tantivy's top-K collector before any deterministic sort runs — so two
+/// replicas returned 199 of 200 different chunks.
+///
+/// Expanding to real `TermQuery`s fixes both at once: BM25 scores each
+/// completion on its own IDF, so a rare one outranks a common one and the tie
+/// disappears. Every expansion carries boost 1.0 — unlike the fuzzy ladder,
+/// where edit distance is a real signal, prefix LENGTH is not: `judicia` as a
+/// literal token is no more what the user meant than `judicial`. Lucene's
+/// scoring prefix rewrite does the same.
+pub fn prefix_alternatives(
+    index: &Index,
+    field: Field,
+    term: Term,
+) -> Result<Box<dyn Query>, TantivyGoError> {
+    let exact = Box::new(TermQuery::new(term.clone(), IndexRecordOption::WithFreqs));
+    let Some(token) = term.value().as_str().map(|s| s.to_string()) else {
+        return Ok(exact);
+    };
+    if token.chars().count() < MIN_PREFIX_LEN {
+        return Ok(exact);
+    }
+    let expansions = expand_prefix(index, field, &token)?;
+    if expansions.is_empty() {
+        return Ok(exact);
+    }
+    let mut subs: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(expansions.len() + 1);
+    subs.push((Occur::Should, exact));
+    for text in expansions {
+        subs.push((
+            Occur::Should,
+            Box::new(TermQuery::new(
+                Term::from_field_text(field, &text),
+                IndexRecordOption::WithFreqs,
+            )),
+        ));
+    }
+    Ok(Box::new(BooleanQuery::new(subs)))
 }
 
 /// Builds the alternatives for one analyzed token: the exact term at full
@@ -314,11 +487,18 @@ mod tests {
     }
 
     fn run(index: &Index, schema: &Schema, fq: FinalQuery) -> Vec<(f32, String)> {
+        run_n(index, schema, fq, 10)
+    }
+
+    /// The prefix tests need more than the default ten slots: their whole
+    /// point is how a LARGE result set is scored and ordered, and a limit of
+    /// ten would cut the evidence off before the assertion sees it.
+    fn run_n(index: &Index, schema: &Schema, fq: FinalQuery, limit: usize) -> Vec<(f32, String)> {
         let q = convert_to_tantivy(index, fq, schema).expect("conversion failed");
         let searcher = index.reader().unwrap().searcher();
         let body = schema.get_field("body").unwrap();
         searcher
-            .search(&q, &TopDocs::with_limit(10))
+            .search(&q, &TopDocs::with_limit(limit))
             .unwrap()
             .into_iter()
             .map(|(score, addr)| {
@@ -402,6 +582,145 @@ mod tests {
             hits[0].0 > hits[1].0,
             "scores must differ; a ConstScorer would tie them: {hits:?}"
         );
+    }
+
+    // ── Prefix matching. ──────────────────────────────────────────────────
+    //
+    // The bug these cover: a prefix clause used to become
+    // `PhrasePrefixQuery`, which is const-scored. A production probe of
+    // `judicia` returned exactly TWO distinct scores — one real hit and 199
+    // documents tied at the clause boost.
+
+    fn indexed_batches(batches: &[&[&str]]) -> (Index, Schema) {
+        let mut b = Schema::builder();
+        let opts = (TEXT | STORED).set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("simple")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let body = b.add_text_field("body", opts);
+        let schema = b.build();
+        let index = Index::create_in_ram(schema.clone());
+        index.tokenizers().register(
+            "simple",
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        );
+        let mut w: IndexWriter = index.writer(15_000_000).unwrap();
+        // One commit per batch, so each batch becomes its own SEGMENT.
+        for batch in batches {
+            for text in *batch {
+                w.add_document(doc!(body => *text)).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        (index, schema)
+    }
+
+    fn prefix_clause(text_index: usize) -> GoQuery {
+        GoQuery::PrefixTermQuery {
+            field_index: 0,
+            text_index,
+            boost: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_prefix_matches_its_completions() {
+        let (index, schema) = indexed_batches(&[&[
+            "judicial review of the decision",
+            "the judiciary is independent",
+            "wages are payable monthly",
+        ]]);
+        let mut fq = one_clause(prefix_clause(0));
+        fq.texts = vec!["judicia".to_string()];
+        let hits = run(&index, &schema, fq);
+        assert_eq!(hits.len(), 2, "expected both completions, got {hits:?}");
+    }
+
+    #[test]
+    fn a_prefix_below_the_minimum_length_does_not_expand() {
+        // The engine-side backstop. The planner already refuses tokens under
+        // three characters, but a two-character prefix opens a large fraction
+        // of any real dictionary and nothing downstream would notice.
+        let (index, schema) = indexed_batches(&[&["zzcommon filler", "zzother filler"]]);
+
+        let mut fq = one_clause(prefix_clause(0));
+        fq.texts = vec!["zz".to_string()];
+        assert!(
+            run(&index, &schema, fq).is_empty(),
+            "a two-character prefix expanded; MIN_PREFIX_LEN is not being applied"
+        );
+
+        // Three characters is allowed, and reaches the one term it prefixes.
+        let mut fq = one_clause(prefix_clause(0));
+        fq.texts = vec!["zzc".to_string()];
+        assert_eq!(run(&index, &schema, fq).len(), 1);
+    }
+
+    #[test]
+    fn a_rarer_completion_outranks_a_common_one() {
+        // One document carries both completions, so document length and term
+        // frequency are held equal and only IDF can separate them.
+        let mut docs: Vec<String> = vec!["prefixrare prefixcommon".to_string()];
+        for _ in 0..30 {
+            docs.push("prefixcommon filler".to_string());
+        }
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let (index, schema) = indexed_batches(&[&refs]);
+
+        let mut fq = one_clause(prefix_clause(0));
+        fq.texts = vec!["prefix".to_string()];
+        let hits = run_n(&index, &schema, fq, 100);
+        assert_eq!(hits.len(), 31, "every document has a completion");
+        let scores: std::collections::BTreeSet<String> =
+            hits.iter().map(|(s, _)| format!("{s:.4}")).collect();
+        assert!(
+            scores.len() > 1,
+            "every completion scored the same — this is the ConstScorer bug: {hits:?}"
+        );
+        // The document holding the RARE completion must come first.
+        assert!(
+            hits[0].1.starts_with("prefixrare"),
+            "the rarer completion did not rank first: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn expansion_does_not_depend_on_segment_layout() {
+        // Two replicas of themis-search build their own index from the same
+        // outbox, so they have DIFFERENT segment layouts. A cap applied while
+        // streaming takes whatever the first segments offered, and the two
+        // answer the same query with different terms. The collector keeps the
+        // lexicographically smallest N instead, which a segment split cannot
+        // change.
+        let mut words: Vec<String> = (0..80).map(|i| format!("prefixed{i:03} filler")).collect();
+        words.sort();
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+
+        let (a, sa) = indexed_batches(&[&refs]);
+        let (b, sb) = indexed_batches(&[&refs[40..], &refs[..40]]);
+        let (c, sc) = indexed_batches(&[&refs[..10], &refs[10..55], &refs[55..]]);
+
+        let ids = |index: &Index, schema: &Schema| -> Vec<String> {
+            let mut fq = one_clause(prefix_clause(0));
+            fq.texts = vec!["prefixed".to_string()];
+            let mut out: Vec<String> =
+                run_n(index, schema, fq, 200).into_iter().map(|(_, t)| t).collect();
+            out.sort();
+            out
+        };
+        let one = ids(&a, &sa);
+        // 80 terms match, the cap is 50, and `prefixed` is not itself an
+        // indexed term — so the exact clause contributes nothing and the
+        // result is exactly the cap. If this ever equals 80 the cap stopped
+        // biting and the test below proves nothing.
+        assert_eq!(
+            one.len(),
+            MAX_PREFIX_EXPANSIONS,
+            "the cap must bite for this test to mean anything"
+        );
+        assert_eq!(one, ids(&b, &sb), "a different segment layout changed the expansion");
+        assert_eq!(one, ids(&c, &sc), "a third segment layout changed the expansion");
     }
 
     #[test]

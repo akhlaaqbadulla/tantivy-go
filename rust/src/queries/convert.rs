@@ -1,4 +1,4 @@
-use crate::queries::fuzzy::token_alternatives;
+use crate::queries::fuzzy::{prefix_alternatives, token_alternatives};
 use crate::queries::{FinalQuery, GoQuery, QueryElement, QueryModifier};
 use crate::tantivy_util::{extract_terms, TantivyGoError};
 use tantivy::query::Occur::{Must, Should};
@@ -219,6 +219,42 @@ pub fn convert_to_tantivy(
                             let alts = token_alternatives(
                                 index, f, term, *distance, *transposition, *prefix,
                             )?;
+                            subs.push(try_boost(Should, weight, alts));
+                        }
+                        Some(try_boost(occur, *boost, Box::new(BooleanQuery::new(subs))))
+                    }
+                }
+                GoQuery::PrefixTermQuery { field_index, text_index, boost } => {
+                    let (f, txt) = get_field_and_text(*field_index, *text_index)?;
+                    let terms = get_terms(f, txt)?;
+                    if terms.is_empty() {
+                        if element.modifier == QueryModifier::Must {
+                            Some(try_boost(occur, *boost, create_impossible_query()))
+                        } else {
+                            return Ok(None);
+                        }
+                    } else {
+                        let alts = prefix_alternatives(index, f, terms[0].1.clone())?;
+                        Some(try_boost(occur, *boost, alts))
+                    }
+                }
+                GoQuery::OneOfPrefixTermQuery { field_index, text_index, boost } => {
+                    let (f, txt) = get_field_and_text(*field_index, *text_index)?;
+                    let terms = get_terms(f, txt)?;
+                    if terms.is_empty() {
+                        if element.modifier == QueryModifier::Must {
+                            Some(try_boost(occur, *boost, create_impossible_query()))
+                        } else {
+                            return Ok(None);
+                        }
+                    } else {
+                        // Same positional weighting as OneOfTermQuery, with
+                        // each token's completions nested inside its own slot.
+                        let mut subs = Vec::new();
+                        let len = terms.len() as f32;
+                        for (i, (_pos, term)) in terms.into_iter().enumerate() {
+                            let weight = 1.0 - 0.5 * ((i + 1) as f32 / len);
+                            let alts = prefix_alternatives(index, f, term)?;
                             subs.push(try_boost(Should, weight, alts));
                         }
                         Some(try_boost(occur, *boost, Box::new(BooleanQuery::new(subs))))

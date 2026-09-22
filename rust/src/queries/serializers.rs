@@ -17,6 +17,8 @@ impl QueryType {
             7 => Some(QueryType::AllQuery),
             8 => Some(QueryType::FuzzyTermQuery),
             9 => Some(QueryType::OneOfFuzzyTermQuery),
+            10 => Some(QueryType::PrefixTermQuery),
+            11 => Some(QueryType::OneOfPrefixTermQuery),
             _ => None,
         }
     }
@@ -177,7 +179,8 @@ impl<'de> Deserialize<'de> for QueryElement {
                 })
             }
             QueryType::PhraseQuery | QueryType::PhrasePrefixQuery | QueryType::TermPrefixQuery
-            | QueryType::TermQuery | QueryType::EveryTermQuery | QueryType::OneOfTermQuery => {
+            | QueryType::TermQuery | QueryType::EveryTermQuery | QueryType::OneOfTermQuery
+            | QueryType::PrefixTermQuery | QueryType::OneOfPrefixTermQuery => {
                 let query_data = extract_query_data::<D>(&map)?;
                 let (field_index, text_index, boost) = extract_query_indices_and_boost(query_data);
 
@@ -208,6 +211,16 @@ impl<'de> Deserialize<'de> for QueryElement {
                         boost,
                     },
                     QueryType::OneOfTermQuery => GoQuery::OneOfTermQuery {
+                        field_index,
+                        text_index,
+                        boost,
+                    },
+                    QueryType::PrefixTermQuery => GoQuery::PrefixTermQuery {
+                        field_index,
+                        text_index,
+                        boost,
+                    },
+                    QueryType::OneOfPrefixTermQuery => GoQuery::OneOfPrefixTermQuery {
                         field_index,
                         text_index,
                         boost,
